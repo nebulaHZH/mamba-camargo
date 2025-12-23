@@ -45,7 +45,7 @@ def load_and_preprocess_data(file_path, test_size=0.2, val_size=0.1):
     """加载并预处理数据"""
     print("正在加载数据...")
     # 读取Excel文件(虽然后缀是.csv但实际是.xlsx)
-    df = pd.read_excel(file_path)
+    df = pd.read_csv(file_path)
     
     print(f"数据集大小: {df.shape}")
     print(f"活动类型分布:\n{df['activity_type'].value_counts()}")
@@ -56,6 +56,7 @@ def load_and_preprocess_data(file_path, test_size=0.2, val_size=0.1):
     X = df[feature_columns].values
     y = df['activity_type'].values
     
+    print(f"\n特征列: {feature_columns}")
     # 标签编码
     label_encoder = LabelEncoder()
     y_encoded = label_encoder.fit_transform(y)
@@ -354,9 +355,9 @@ def plot_confusion_matrix(y_true, y_pred, labels, save_path='confusion_matrix.pn
 def main():
     # 配置参数
     config = {
-        'data_path': 'data.csv',
+        'data_path': 'all_fused_features.csv',
         'batch_size': 64,
-        'num_epochs': 50,
+        'num_epochs': 100,
         'learning_rate': 0.001,
         'd_model': 128,
         'n_layers': 4,
