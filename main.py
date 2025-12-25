@@ -115,9 +115,10 @@ class MambaBlock(nn.Module):
         self.x_proj = nn.Linear(self.d_inner, d_state * 2, bias=False)
         self.dt_proj = nn.Linear(self.d_inner, self.d_inner, bias=True)
         
-        # 状态空间参数
-        A = torch.randn(d_state, self.d_inner)
-        self.A_log = nn.Parameter(torch.log(A))
+        # 状态空间参数（改进初始化）
+        A = torch.arange(1, d_state + 1, dtype=torch.float32).unsqueeze(1).repeat(1, self.d_inner)
+        A = A / d_state  # 归一化到[0,1]
+        self.A_log = nn.Parameter(torch.log(A + 1e-4))  # 避免log(0)
         self.D = nn.Parameter(torch.ones(self.d_inner))
         
         # 输出投影
@@ -156,11 +157,11 @@ class MambaBlock(nn.Module):
         return out
     
     def ssm(self, x):
-        """选择性状态空间模型(简化版)"""
+        """选择性状态空间模型(改进版)"""
         batch, seq_len, d_inner = x.shape
         
         # 计算SSM参数
-        A = -torch.exp(self.A_log.float()).transpose(0, 1)  # (d_inner, d_state)
+        A = -torch.exp(self.A_log.float())  # (d_state, d_inner)
         D = self.D.float()  # (d_inner,)
         
         # 选择性参数
@@ -170,17 +171,31 @@ class MambaBlock(nn.Module):
         # 离散化参数
         delta = F.softplus(self.dt_proj(x))  # (batch, seq_len, d_inner)
         
-        # 简化的SSM计算: 直接使用全局池化
-        # 这里使用一个简化的方法，避免复杂的状态递归
-        # y = ∑(B * x * C) + D * x
+        # 改进的SSM计算
+        # 1. 使用B、C矩阵进行状态空间变换
+        # B: (batch, seq_len, d_state), x: (batch, seq_len, d_inner)
+        # 通过爱因斯坦求和实现高效的状态空间操作
         
-        # 将B和C投影到d_inner维度
-        B_proj = B @ self.A_log[:, :d_inner // 4]  # 简化投影
-        C_proj = C @ self.A_log[:, :d_inner // 4]  # 简化投影
+        # 将x投影到状态空间
+        # (batch, seq_len, d_inner) -> (batch, seq_len, d_state, d_inner)
+        x_expanded = x.unsqueeze(2)  # (batch, seq_len, 1, d_inner)
+        B_expanded = B.unsqueeze(3)  # (batch, seq_len, d_state, 1)
         
-        # 门控机制
-        y = x * delta  # 时间依赖性
-        y = y + x * D  # skip connection
+        # 状态空间变换: h = B * x
+        h = B_expanded * x_expanded  # (batch, seq_len, d_state, d_inner)
+        
+        # 应用A矩阵（状态转移）
+        h = h * torch.exp(A.unsqueeze(0).unsqueeze(0))  # (batch, seq_len, d_state, d_inner)
+        
+        # 应用C矩阵（输出投影）
+        C_expanded = C.unsqueeze(3)  # (batch, seq_len, d_state, 1)
+        y = (h * C_expanded).sum(dim=2)  # (batch, seq_len, d_inner)
+        
+        # 时间依赖性调制
+        y = y * delta
+        
+        # Skip connection
+        y = y + x * D.unsqueeze(0).unsqueeze(0)
         
         return y
 
@@ -204,9 +219,17 @@ class MambaClassifier(nn.Module):
                  d_state=16, d_conv=4, expand=2, dropout=0.1):
         super().__init__()
         
-        # 输入嵌入层
+        # 输入嵌入层（调整以适应序列输入）
+        # 序列长度固定为8，每个时间步的特征维度会在forward中动态计算
+        self.seq_len = 8
+        # 这里input_dim是原始特征维度，会在forward中重塑
+        self.input_dim = input_dim
+        
+        # 计算每个时间步的特征维度（向上取整）
+        feature_per_step = (input_dim + self.seq_len - 1) // self.seq_len
+        
         self.embedding = nn.Sequential(
-            nn.Linear(input_dim, d_model),
+            nn.Linear(feature_per_step, d_model),
             nn.LayerNorm(d_model),
             nn.Dropout(dropout)
         )
@@ -228,16 +251,27 @@ class MambaClassifier(nn.Module):
         
     def forward(self, x):
         """
-        x: (batch, input_dim) 或 (batch, seq_len, input_dim)
+        x: (batch, input_dim)
+        对于时频域特征数据，我们需要重塑为序列以利用Mamba的建模能力
         """
-        # 如果输入是2D，添加序列维度
-        if x.dim() == 2:
-            x = x.unsqueeze(1)  # (batch, 1, input_dim)
+        batch_size, input_dim = x.shape
         
-        # 嵌入
+        # 将特征向量重塑为序列
+        # 策略：将特征分组为多个时间步
+        seq_len = 8  # 将特征分为8个时间步
+        if input_dim % seq_len != 0:
+            # 如果不能整除，padding到最近的倍数
+            pad_size = seq_len - (input_dim % seq_len)
+            x = F.pad(x, (0, pad_size), mode='constant', value=0)
+            input_dim = x.shape[1]
+        
+        # 重塑为序列: (batch, seq_len, feature_per_step)
+        x = x.view(batch_size, seq_len, input_dim // seq_len)
+        
+        # 嵌入到d_model维度
         x = self.embedding(x)  # (batch, seq_len, d_model)
         
-        # Mamba层
+        # Mamba层处理序列
         for layer in self.layers:
             x = layer(x)
         
